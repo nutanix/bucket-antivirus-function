@@ -18,6 +18,8 @@ import json
 import os
 import urllib
 from distutils.util import strtobool
+from datetime import datetime
+import requests
 
 import boto3
 
@@ -37,8 +39,12 @@ from common import AV_STATUS_SNS_ARN
 from common import AV_STATUS_SNS_PUBLISH_CLEAN
 from common import AV_STATUS_SNS_PUBLISH_INFECTED
 from common import AV_TIMESTAMP_METADATA
+from common import AV_STATUS_PENDING
+from common import AV_STATUS_CALL_API_MAP
+from common import AV_SIGNATURE_OK
 from common import create_dir
 from common import get_timestamp
+from pdfid_PL import PDFiD
 
 
 def event_object(event, event_source="s3"):
@@ -197,11 +203,48 @@ def sns_scan_results(
         },
     )
 
+def call_api_with_scan_results(s3_object, result):
+    if AV_STATUS_CALL_API_MAP is None:
+        return
+
+    try:
+        av_status_call_api_map = str(AV_STATUS_CALL_API_MAP)
+        av_status_call_api_map = eval(AV_STATUS_CALL_API_MAP.replace('"', '\"'))
+
+        av_status_call_api = av_status_call_api_map[s3_object.bucket_name]
+
+        av_status_call_api_url = av_status_call_api['url']
+        av_status_call_api_username = av_status_call_api['username']
+        av_status_call_api_password = av_status_call_api['password']
+    except ValueError:
+        print("Skipping API call with scan results, encountered error while parsing AV_STATUS_CALL_API_MAP")
+        return
+
+    message = {
+        "bucket": s3_object.bucket_name,
+        "key": s3_object.key,
+        "version": s3_object.version_id,
+        AV_STATUS_METADATA: result,
+        AV_TIMESTAMP_METADATA: datetime.utcnow().strftime("%Y/%m/%d %H:%M:%S UTC")
+    }
+
+    if av_status_call_api_url is None:
+        print("Skipping API call with scan results, missing url for bucket %s" % s3_object.bucket_name)
+        return
+
+    print("Calling API %s with scan results" % av_status_call_api_url)
+
+    requests.put(
+        av_status_call_api_url,
+        data=message,
+        auth=(av_status_call_api_username, av_status_call_api_password)
+    )
 
 def lambda_handler(event, context):
     s3 = boto3.resource("s3")
     s3_client = boto3.client("s3")
     sns_client = boto3.client("sns")
+    infected = False
 
     # Get some environment variables
     ENV = os.getenv("ENV", "")
@@ -223,21 +266,32 @@ def lambda_handler(event, context):
     create_dir(os.path.dirname(file_path))
     s3_object.download_file(file_path)
 
-    to_download = clamav.update_defs_from_s3(
-        s3_client, AV_DEFINITION_S3_BUCKET, AV_DEFINITION_S3_PREFIX
-    )
+    filename, file_extension = os.path.splitext(file_path)
+    if file_extension == '.pdf':
+        try:
+            xmldoc, infected = PDFiD(file_path, raise_exceptions=False, return_cleaned=True)
+        except:
+            print('Exception occured while scanning PDF by PDFiD')
+    if infected:
+        scan_result = 'INFECTED'
+        scan_signature = AV_SIGNATURE_OK
+        print("Scan of s3://%s resulted in %s by PDFiD scan" % (os.path.join(s3_object.bucket_name, s3_object.key), scan_result))
+    else: 
+        to_download = clamav.update_defs_from_s3(
+            s3_client, AV_DEFINITION_S3_BUCKET, AV_DEFINITION_S3_PREFIX
+        )
 
-    for download in to_download.values():
-        s3_path = download["s3_path"]
-        local_path = download["local_path"]
-        print("Downloading definition file %s from s3://%s" % (local_path, s3_path))
-        s3.Bucket(AV_DEFINITION_S3_BUCKET).download_file(s3_path, local_path)
-        print("Downloading definition file %s complete!" % (local_path))
-    scan_result, scan_signature = clamav.scan_file(file_path)
-    print(
-        "Scan of s3://%s resulted in %s\n"
-        % (os.path.join(s3_object.bucket_name, s3_object.key), scan_result)
-    )
+        for download in to_download.values():
+            s3_path = download["s3_path"]
+            local_path = download["local_path"]
+            print("Downloading definition file %s from s3://%s" % (local_path, s3_path))
+            s3.Bucket(AV_DEFINITION_S3_BUCKET).download_file(s3_path, local_path)
+            print("Downloading definition file %s complete!" % (local_path))
+        scan_result, scan_signature = clamav.scan_file(file_path)
+        print(
+            "Scan of s3://%s resulted in %s\n"
+            % (os.path.join(s3_object.bucket_name, s3_object.key), scan_result)
+        )
 
     result_time = get_timestamp()
     # Set the properties on the object with the scan results
@@ -255,7 +309,7 @@ def lambda_handler(event, context):
             scan_signature,
             result_time,
         )
-
+    call_api_with_scan_results(s3_object, scan_result)
     metrics.send(
         env=ENV, bucket=s3_object.bucket_name, key=s3_object.key, status=scan_result
     )
